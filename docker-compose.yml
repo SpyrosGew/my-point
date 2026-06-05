@@ -1,0 +1,49 @@
+services:
+  pointing-demo:
+    build: .
+    image: realsense-pointing-demo:latest
+    container_name: realsense-pointing-demo
+    privileged: true
+    runtime: nvidia
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: yolov8n-seg.pt
+      YOLO_DEVICE: "0"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      CONFIDENCE: "0.30"
+      YOLO_IMGSZ: "640"
+      EXCLUDED_TARGET_LABELS: "person"
+      DEPTH_MIN_M: "0.15"
+      DEPTH_MAX_M: "4.0"
+      POINTING_SMOOTHING: "0.45"
+      MIN_HAND_RAY_LENGTH_M: "0.025"
+      HAND_BACKEND: mediapipe
+      HAND_MODEL_PATH: models/sveldman_hand_model.pt
+      HAND_DEVICE: "0"
+      HAND_IMGSZ: "640"
+      HAND_CONFIDENCE: "0.10"
+      HAND_KEYPOINT_VISIBILITY: "0.05"
+      HAND_KEYPOINT_CONFIDENCE: "0.15"
+      HAND_TRACKING_CONFIDENCE: "0.30"
+      MAX_HANDS: "1"
+      HAND_PROCESS_WIDTH: "640"
+      HAND_MODEL_COMPLEXITY: "1"
+      POINTING_START_LANDMARK: "5"
+      POINTING_END_LANDMARK: "8"
+      FRAME_WIDTH: "1280"
+      FRAME_HEIGHT: "720"
+      FRAME_FPS: "30"
+      JPEG_QUALITY: "85"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      NUMEXPR_NUM_THREADS: "2"
+      LD_LIBRARY_PATH: "/usr/local/lib/python3.10/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.10/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.10/site-packages/nvidia/curand/lib:/usr/local/lib/python3.10/site-packages/nvidia/cusolver/lib:/usr/local/lib/python3.10/site-packages/nvidia/cusparse/lib:/usr/local/lib/python3.10/site-packages/nvidia/nccl/lib:/usr/local/lib/python3.10/site-packages/nvidia/nvtx/lib"
+    volumes:
+      - .:/workspace
+      - ./models:/workspace/models
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    command: python -m pointing_demo
