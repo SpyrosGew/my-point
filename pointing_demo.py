@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
 import threading
 import traceback
 import time
@@ -13,7 +15,7 @@ import numpy as np
 import pyrealsense2 as rs
 import uvicorn
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from ultralytics import YOLO
 
 
@@ -55,6 +57,27 @@ class PointingRay:
     index_2d: tuple[int, int]
 
 
+@dataclass
+class SceneSnapshot:
+    image: np.ndarray
+    candidates: list[ObjectCandidate]
+    ray: PointingRay | None
+    intrinsics: rs.intrinsics | None
+    text_filter: str
+
+
+@dataclass
+class CommandResult:
+    command: str
+    target_label: str
+    target_index: int | None
+    target_3d: list[float] | None
+    confidence: float
+    reason: str
+    mode: str
+    annotated_path: str
+
+
 class SharedState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -62,6 +85,9 @@ class SharedState:
         self.text_filter = ""
         self.status = "starting"
         self.metrics: dict[str, float | int | str] = {}
+        self.latest_scene: SceneSnapshot | None = None
+        self.last_command_result: CommandResult | None = None
+        self.paused_for_command = False
         self.running = True
 
     def set_frame(self, image: np.ndarray, status: str, metrics: dict[str, float | int | str] | None = None) -> None:
@@ -92,6 +118,37 @@ class SharedState:
     def set_filter(self, value: str) -> None:
         with self.lock:
             self.text_filter = value.strip().lower()
+
+    def set_scene(
+        self,
+        image: np.ndarray,
+        candidates: list[ObjectCandidate],
+        ray: PointingRay | None,
+        intrinsics: rs.intrinsics | None,
+        text_filter: str,
+    ) -> None:
+        with self.lock:
+            self.latest_scene = SceneSnapshot(image.copy(), list(candidates), ray, intrinsics, text_filter)
+
+    def get_scene(self) -> SceneSnapshot | None:
+        with self.lock:
+            return self.latest_scene
+
+    def set_command_result(self, result: CommandResult) -> None:
+        with self.lock:
+            self.last_command_result = result
+
+    def get_command_result(self) -> CommandResult | None:
+        with self.lock:
+            return self.last_command_result
+
+    def set_paused(self, value: bool) -> None:
+        with self.lock:
+            self.paused_for_command = value
+
+    def is_paused(self) -> bool:
+        with self.lock:
+            return self.paused_for_command
 
 
 class RealSenseCamera:
@@ -715,8 +772,8 @@ SPATIAL_ALIASES = {
     "lower": "bottom",
 }
 QUERY_STOPWORDS = {
-    "a", "an", "and", "at", "by", "for", "i", "in", "is", "it", "of", "on", "one", "that", "the", "this", "to",
-    "want", "with",
+    "a", "an", "and", "at", "by", "for", "i", "in", "is", "it", "me", "of", "on", "one", "that", "the", "this", "to",
+    "bring", "fetch", "get", "give", "grab", "pick", "please", "robot", "take", "want", "with",
 }
 
 
@@ -936,6 +993,171 @@ def project_point_3d(point: np.ndarray, intrinsics: rs.intrinsics) -> tuple[int,
     return pixel_x, pixel_y
 
 
+class VLMTargetSelector:
+    def __init__(self) -> None:
+        self.model_name = os.getenv("VLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
+        self.device = os.getenv("VLM_DEVICE", "cuda")
+        self.max_new_tokens = env_int("VLM_MAX_NEW_TOKENS", 96)
+        self.enabled = env_tokens("VLM_ENABLED", "1") not in ({"0"}, {"false"}, {"no"})
+        self.processor = None
+        self.model = None
+
+    def choose(self, image_bgr: np.ndarray, candidate_records: list[dict], command: str) -> dict:
+        if not self.enabled:
+            raise RuntimeError("VLM is disabled")
+        self.load()
+        from PIL import Image
+        from qwen_vl_utils import process_vision_info
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(image_rgb)
+        candidates_text = "\n".join(
+            f"{item['id']}: {item['label']} box={item['box']} pointing_score={item['pointing_score']:.2f} "
+            f"spatial_score={item['language_score']:.2f}"
+            for item in candidate_records
+        )
+        prompt = (
+            "You are selecting the object a robot should fetch. The image has a yellow pointing line "
+            "and candidate objects marked with letter IDs. Use the pointing line plus the user's command.\n"
+            f"User command: {command!r}\n"
+            f"Candidates:\n{candidates_text}\n"
+            "Return strict JSON only: {\"target_id\":\"A\",\"confidence\":0.0," 
+            "\"reason\":\"short reason\"}. If unsure, choose the closest reasonable candidate and lower confidence."
+        )
+        messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(
+            text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
+        ).to(self.model.device)
+        generated_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+        return parse_vlm_json(output)
+
+    def load(self) -> None:
+        if self.model is not None and self.processor is not None:
+            return
+        import torch
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.model_name,
+            torch_dtype=dtype,
+            device_map="auto" if self.device == "cuda" else None,
+        )
+        if self.device != "cuda":
+            self.model.to(self.device)
+        self.processor = AutoProcessor.from_pretrained(self.model_name)
+
+
+vlm_selector = VLMTargetSelector()
+
+
+def parse_vlm_json(output: str) -> dict:
+    match = re.search(r"\{.*\}", output, flags=re.DOTALL)
+    if not match:
+        raise RuntimeError(f"VLM did not return JSON: {output[:300]}")
+    data = json.loads(match.group(0))
+    return {
+        "target_id": str(data.get("target_id", "")).strip().upper(),
+        "confidence": float(data.get("confidence", 0.0)),
+        "reason": str(data.get("reason", ""))[:240],
+    }
+
+
+def build_command_candidates(scene: SceneSnapshot, command: str, max_candidates: int = 8) -> list[ObjectCandidate]:
+    working = list(scene.candidates)
+    score_candidates(working, scene.ray, command)
+    usable = [candidate for candidate in working if np.isfinite(candidate.ray_distance_m)]
+    usable.sort(key=lambda item: item.final_score, reverse=True)
+    return usable[:max_candidates]
+
+
+def draw_vlm_query_image(
+    image: np.ndarray,
+    candidates: list[ObjectCandidate],
+    ray: PointingRay | None,
+    intrinsics: rs.intrinsics | None,
+) -> tuple[np.ndarray, list[dict], dict[str, ObjectCandidate]]:
+    output = image.copy()
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    records: list[dict] = []
+    by_id: dict[str, ObjectCandidate] = {}
+
+    if ray is not None:
+        end = project_ray_endpoint_2d(ray, intrinsics, output.shape[1], output.shape[0])
+        if end is not None:
+            cv2.line(output, ray.wrist_2d, end, (0, 255, 255), 4)
+            cv2.circle(output, ray.wrist_2d, 8, (255, 255, 0), -1)
+            cv2.circle(output, end, 7, (0, 255, 255), -1)
+
+    for idx, candidate in enumerate(candidates[:len(labels)]):
+        object_id = labels[idx]
+        ys, xs = np.where(candidate.mask)
+        if len(xs) == 0:
+            continue
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        color = (0, 220, 0) if idx == 0 else (0, 0, 255)
+        cv2.rectangle(output, (x0, y0), (x1, y1), color, 3)
+        draw_label(output, f"{object_id}: {candidate.label}", (x0, max(24, y0 - 8)), (255, 255, 255), background=color)
+        records.append({
+            "id": object_id,
+            "index": candidate.index,
+            "label": candidate.label,
+            "box": [x0, y0, x1, y1],
+            "pointing_score": candidate.pointing_score,
+            "language_score": candidate.language_score,
+            "final_score": candidate.final_score,
+        })
+        by_id[object_id] = candidate
+    return output, records, by_id
+
+
+def choose_target_for_command(scene: SceneSnapshot, command: str) -> CommandResult:
+    candidates = build_command_candidates(scene, command)
+    if not candidates:
+        raise RuntimeError("No pointed candidates available for the command")
+
+    annotated, records, by_id = draw_vlm_query_image(scene.image, candidates, scene.ray, scene.intrinsics)
+    os.makedirs("outputs", exist_ok=True)
+    path = os.path.join("outputs", "latest_vlm_query.jpg")
+    cv2.imwrite(path, annotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    mode = "spatial"
+    chosen = candidates[0]
+    confidence = float(chosen.final_score)
+    reason = "Spatial fallback selected the best candidate from pointing plus text."
+    if env_tokens("VLM_ENABLED", "1") not in ({"0"}, {"false"}, {"no"}):
+        try:
+            decision = vlm_selector.choose(annotated, records, command)
+            target_id = decision["target_id"]
+            if target_id in by_id:
+                chosen = by_id[target_id]
+                confidence = float(decision["confidence"])
+                reason = decision["reason"]
+                mode = "vlm"
+        except Exception as exc:
+            reason = f"VLM failed, used spatial fallback: {exc}"
+
+    return CommandResult(
+        command=command,
+        target_label=chosen.label,
+        target_index=chosen.index,
+        target_3d=[round(float(value), 3) for value in chosen.centroid_3d],
+        confidence=round(confidence, 3),
+        reason=reason,
+        mode=mode,
+        annotated_path=path,
+    )
+
+
 def blank_frame(message: str, width: int = 960, height: int = 540) -> np.ndarray:
     image = np.full((height, width, 3), 245, dtype=np.uint8)
     draw_label(image, message, (24, 48), (20, 20, 20), background=(245, 245, 245))
@@ -958,6 +1180,10 @@ def worker(state: SharedState) -> None:
         segmenter = ObjectSegmenter()
 
         while state.running:
+            if state.is_paused():
+                time.sleep(0.05)
+                continue
+
             frame_start = time.perf_counter()
             start = frame_start
             color, depth = camera.read()
@@ -978,6 +1204,7 @@ def worker(state: SharedState) -> None:
 
             start = time.perf_counter()
             overlay = draw_overlay(color, candidates, ray, selected, text_filter, camera.intrinsics)
+            state.set_scene(color, candidates, ray, camera.intrinsics, text_filter)
             draw_ms = (time.perf_counter() - start) * 1000.0
 
             total_ms = (time.perf_counter() - frame_start) * 1000.0
@@ -1051,8 +1278,12 @@ def index() -> str:
     <main>
       <header>
         <form method="post" action="/filter">
-          <input name="text_filter" placeholder="e.g. right chair, closest cup, middle bottle" />
+          <input name="text_filter" placeholder="live bias, e.g. right chair" />
           <button type="submit">Apply</button>
+        </form>
+        <form method="post" action="/command">
+          <input name="command" placeholder="command, e.g. get the chair on the right" />
+          <button type="submit">Ask VLM</button>
         </form>
         <form method="post" action="/filter">
           <input name="text_filter" type="hidden" value="" />
@@ -1077,10 +1308,43 @@ def set_filter(text_filter: str = Form(default="")) -> HTMLResponse:
     )
 
 
+@app.post("/command")
+def command(command: str = Form(default="")) -> HTMLResponse:
+    command = command.strip()
+    if not command:
+        return HTMLResponse('<meta http-equiv="refresh" content="0; url=/" />', status_code=303, headers={"Location": "/"})
+    scene = state.get_scene()
+    if scene is None:
+        raise RuntimeError("No live scene available yet")
+    state.set_paused(True)
+    try:
+        result = choose_target_for_command(scene, command)
+    finally:
+        state.set_paused(False)
+    state.set_command_result(result)
+    state.set_filter(command)
+    return HTMLResponse('<meta http-equiv="refresh" content="0; url=/" />', status_code=303, headers={"Location": "/"})
+
+
 @app.get("/status")
-def status() -> dict[str, str | dict[str, float | int | str]]:
+def status() -> dict[str, object]:
     _, current = state.get_frame()
-    return {"status": current, "filter": state.get_filter(), "metrics": state.get_metrics()}
+    result = state.get_command_result()
+    return {
+        "status": current,
+        "filter": state.get_filter(),
+        "metrics": state.get_metrics(),
+        "paused_for_command": state.is_paused(),
+        "last_command": result.__dict__ if result is not None else None,
+    }
+
+
+@app.get("/vlm-query.jpg")
+def vlm_query_image() -> FileResponse:
+    path = os.path.join("outputs", "latest_vlm_query.jpg")
+    if not os.path.exists(path):
+        raise RuntimeError("No VLM query image has been created yet")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 def stream_frames():

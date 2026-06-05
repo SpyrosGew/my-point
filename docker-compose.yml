@@ -36,6 +36,12 @@ services:
       FRAME_HEIGHT: "720"
       FRAME_FPS: "30"
       JPEG_QUALITY: "85"
+      VLM_ENABLED: "1"
+      VLM_MODEL: Qwen/Qwen2.5-VL-3B-Instruct
+      VLM_DEVICE: cuda
+      VLM_MAX_NEW_TOKENS: "96"
+      LANGUAGE_WEIGHT: "0.55"
+      MAX_RAY_ANGLE_DEG: "35"
       OMP_NUM_THREADS: "2"
       OPENBLAS_NUM_THREADS: "2"
       MKL_NUM_THREADS: "2"
@@ -44,6 +50,7 @@ services:
     volumes:
       - .:/workspace
       - ./models:/workspace/models
+      - ./models/huggingface:/root/.cache/huggingface
     devices:
       - /dev/bus/usb:/dev/bus/usb
     command: python -m pointing_demo
