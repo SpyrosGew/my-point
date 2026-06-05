@@ -1,4 +1,30 @@
-# RealSense Pointing Demo
+# RealSense Pointing Object Detection Demo
+
+To use this application you need a realsense RGB-D camera and a pc with a decent graphics card that can run yolo.
+
+The pipeline is simple.
+
+1. The Intel RealSense RGB-D camera captures synchronized RGB and depth frames of the environment.
+
+2. A real-time object detection model processes the RGB frame and detects objects in 2D space. Any detector can be used, as long as it runs at a minimum of 15 FPS.
+
+3. In parallel, a hand pose estimation model tracks the user’s hand and extracts two key points on the index finger to define the pointing direction.
+
+4. The extracted finger points are mapped to the depth frame and converted into 3D coordinates.
+
+5. A 3D pointing ray is constructed from these two points and extended into the scene to estimate where the user is pointing.
+
+6. Based on the ray direction, depth information, and distance from the camera, a region of interest is selected. Only objects inside this region are kept as candidate targets.
+
+7. The user provides a textual description of the desired object while pointing toward it.
+
+8. A vision-language model receives:
+   - cropped images of the candidate objects inside the selected region
+   - a full-scene image for global context
+   - the user’s textual description of the target object
+
+9. Using both the visual inputs and the text description, the VLM selects the object that best matches the user’s intent.
+
 
 Dockerized RGB-D pointing demo:
 
