@@ -41,6 +41,9 @@ class ObjectCandidate:
     centroid_2d: tuple[int, int]
     ray_distance_m: float = float("inf")
     ray_angle_deg: float = float("inf")
+    pointing_score: float = 0.0
+    language_score: float = 0.0
+    final_score: float = 0.0
     selected: bool = False
 
 
@@ -615,19 +618,21 @@ def score_candidates(
         candidate.selected = False
         candidate.ray_distance_m = float("inf")
         candidate.ray_angle_deg = float("inf")
+        candidate.pointing_score = 0.0
+        candidate.language_score = 0.0
+        candidate.final_score = 0.0
 
     if ray is None:
         return None
 
-    filtered = filter_candidates(candidates, text_filter)
+    query = parse_query(text_filter)
+    filtered = filter_candidates(candidates, query)
     excluded_labels = env_tokens("EXCLUDED_TARGET_LABELS", "person")
     filtered = [candidate for candidate in filtered if candidate.label.lower() not in excluded_labels]
     if not filtered:
         return None
 
-    best: ObjectCandidate | None = None
-    best_score = float("inf")
-
+    max_angle_deg = env_float("MAX_RAY_ANGLE_DEG", 35.0)
     for candidate in filtered:
         vectors = candidate.points_3d - ray.origin_3d
         forward = vectors @ ray.direction_3d
@@ -651,9 +656,26 @@ def score_candidates(
         candidate.ray_distance_m = nearest_distance
         candidate.ray_angle_deg = angle
 
-        score = nearest_distance + 0.001 * angle + 0.005 * max(0.0, centroid_distance - 1.0)
-        if score < best_score:
-            best_score = score
+        distance_score = math.exp(-nearest_distance / 0.12)
+        angle_score = max(0.0, 1.0 - angle / max(max_angle_deg, 1.0))
+        candidate.pointing_score = float(np.clip(0.70 * distance_score + 0.30 * angle_score, 0.0, 1.0))
+
+    score_language(filtered, query)
+    language_weight = env_float("LANGUAGE_WEIGHT", 0.55 if query.has_language else 0.0)
+    language_weight = float(np.clip(language_weight, 0.0, 1.0))
+
+    best: ObjectCandidate | None = None
+    best_score = -1.0
+    for candidate in filtered:
+        if not np.isfinite(candidate.ray_distance_m):
+            continue
+        candidate.final_score = (
+            (1.0 - language_weight) * candidate.pointing_score
+            + language_weight * candidate.language_score
+            + 0.05 * candidate.confidence
+        )
+        if candidate.final_score > best_score:
+            best_score = candidate.final_score
             best = candidate
 
     if best is not None:
@@ -661,14 +683,149 @@ def score_candidates(
     return best
 
 
-def filter_candidates(candidates: Iterable[ObjectCandidate], text_filter: str) -> list[ObjectCandidate]:
-    if not text_filter:
-        return list(candidates)
-    tokens = [token for token in text_filter.replace(",", " ").split() if token]
-    if not tokens:
-        return list(candidates)
-    return [candidate for candidate in candidates if any(token in candidate.label.lower() for token in tokens)]
+@dataclass
+class SelectionQuery:
+    raw: str
+    label_tokens: set[str]
+    spatial_terms: set[str]
 
+    @property
+    def has_language(self) -> bool:
+        return bool(self.label_tokens or self.spatial_terms)
+
+
+SPATIAL_ALIASES = {
+    "left": "left",
+    "right": "right",
+    "middle": "middle",
+    "center": "middle",
+    "centre": "middle",
+    "central": "middle",
+    "closest": "closest",
+    "nearest": "closest",
+    "near": "closest",
+    "front": "closest",
+    "farthest": "farthest",
+    "furthest": "farthest",
+    "far": "farthest",
+    "back": "farthest",
+    "top": "top",
+    "upper": "top",
+    "bottom": "bottom",
+    "lower": "bottom",
+}
+QUERY_STOPWORDS = {
+    "a", "an", "and", "at", "by", "for", "i", "in", "is", "it", "of", "on", "one", "that", "the", "this", "to",
+    "want", "with",
+}
+
+
+def parse_query(text_filter: str) -> SelectionQuery:
+    raw_tokens = [token for token in text_filter.replace(",", " ").split() if token]
+    label_tokens: set[str] = set()
+    spatial_terms: set[str] = set()
+    for token in raw_tokens:
+        normalized = normalize_query_token(token)
+        if not normalized or normalized in QUERY_STOPWORDS:
+            continue
+        spatial = SPATIAL_ALIASES.get(normalized)
+        if spatial is not None:
+            spatial_terms.add(spatial)
+            continue
+        label_tokens.add(normalized)
+    return SelectionQuery(raw=text_filter, label_tokens=label_tokens, spatial_terms=spatial_terms)
+
+
+def normalize_query_token(token: str) -> str:
+    normalized = "".join(ch for ch in token.lower() if ch.isalnum() or ch in {"_", "-"})
+    if len(normalized) > 3 and normalized.endswith("s"):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def filter_candidates(candidates: Iterable[ObjectCandidate], query: SelectionQuery) -> list[ObjectCandidate]:
+    if not query.label_tokens:
+        return list(candidates)
+    return [candidate for candidate in candidates if label_matches(candidate.label, query.label_tokens)]
+
+
+def label_matches(label: str, tokens: set[str]) -> bool:
+    label_tokens = {normalize_query_token(token) for token in label.replace("_", " ").replace("-", " ").split()}
+    label_text = normalize_query_token(label)
+    return any(token in label_tokens or token in label_text for token in tokens)
+
+
+def score_language(candidates: list[ObjectCandidate], query: SelectionQuery) -> None:
+    if not candidates:
+        return
+    if not query.has_language:
+        for candidate in candidates:
+            candidate.language_score = 0.0
+        return
+
+    spatial_scores = spatial_language_scores(candidates, query.spatial_terms)
+    for candidate in candidates:
+        label_score = 1.0 if not query.label_tokens or label_matches(candidate.label, query.label_tokens) else 0.0
+        spatial_score = spatial_scores.get(candidate.index, 1.0 if not query.spatial_terms else 0.0)
+        if query.label_tokens and query.spatial_terms:
+            candidate.language_score = 0.35 * label_score + 0.65 * spatial_score
+        elif query.label_tokens:
+            candidate.language_score = label_score
+        else:
+            candidate.language_score = spatial_score
+
+
+def spatial_language_scores(candidates: list[ObjectCandidate], terms: set[str]) -> dict[int, float]:
+    if not terms:
+        return {candidate.index: 1.0 for candidate in candidates}
+
+    xs = np.array([candidate.centroid_2d[0] for candidate in candidates], dtype=np.float32)
+    ys = np.array([candidate.centroid_2d[1] for candidate in candidates], dtype=np.float32)
+    zs = np.array([candidate.centroid_3d[2] for candidate in candidates], dtype=np.float32)
+
+    scores: dict[int, list[float]] = {candidate.index: [] for candidate in candidates}
+    add_rank_scores(candidates, xs, scores, reverse="right" in terms, enabled_terms=terms & {"left", "right"})
+    add_middle_scores(candidates, xs, scores, "middle" in terms)
+    add_rank_scores(candidates, ys, scores, reverse="bottom" in terms, enabled_terms=terms & {"top", "bottom"})
+    add_rank_scores(candidates, zs, scores, reverse="farthest" in terms, enabled_terms=terms & {"closest", "farthest"})
+
+    return {
+        candidate.index: float(np.mean(scores[candidate.index])) if scores[candidate.index] else 0.0
+        for candidate in candidates
+    }
+
+
+def add_rank_scores(
+    candidates: list[ObjectCandidate],
+    values: np.ndarray,
+    scores: dict[int, list[float]],
+    reverse: bool,
+    enabled_terms: set[str],
+) -> None:
+    if not enabled_terms:
+        return
+    value_min = float(np.min(values))
+    value_max = float(np.max(values))
+    span = max(value_max - value_min, 1.0)
+    for candidate, value in zip(candidates, values):
+        normalized = (float(value) - value_min) / span
+        scores[candidate.index].append(normalized if reverse else 1.0 - normalized)
+
+
+def add_middle_scores(
+    candidates: list[ObjectCandidate],
+    values: np.ndarray,
+    scores: dict[int, list[float]],
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    value_min = float(np.min(values))
+    value_max = float(np.max(values))
+    middle = (value_min + value_max) * 0.5
+    half_span = max((value_max - value_min) * 0.5, 1.0)
+    for candidate, value in zip(candidates, values):
+        scores[candidate.index].append(max(0.0, 1.0 - abs(float(value) - middle) / half_span))
 
 def draw_overlay(
     image: np.ndarray,
@@ -699,7 +856,7 @@ def draw_overlay(
         cv2.rectangle(output, (x0, y0), (x1, y1), color.tolist(), 2)
         label = f"{candidate.label} {candidate.confidence:.2f}"
         if np.isfinite(candidate.ray_distance_m):
-            label += f" {candidate.ray_distance_m:.2f}m"
+            label += f" p={candidate.pointing_score:.2f} l={candidate.language_score:.2f}"
         draw_label(output, label, (x0, max(18, y0 - 6)), color.tolist())
 
     if ray is not None:
@@ -714,7 +871,10 @@ def draw_overlay(
 
     status = "selected: none"
     if selected is not None:
-        status = f"selected: {selected.label} dist={selected.ray_distance_m:.2f}m angle={selected.ray_angle_deg:.1f}deg"
+        status = (
+            f"selected: {selected.label} score={selected.final_score:.2f} "
+            f"p={selected.pointing_score:.2f} l={selected.language_score:.2f}"
+        )
     if text_filter:
         status += f" filter={text_filter}"
     draw_label(output, status, (12, 28), (20, 20, 20), background=(245, 245, 245))
@@ -891,7 +1051,7 @@ def index() -> str:
     <main>
       <header>
         <form method="post" action="/filter">
-          <input name="text_filter" placeholder="optional filter, e.g. cup" />
+          <input name="text_filter" placeholder="e.g. right chair, closest cup, middle bottle" />
           <button type="submit">Apply</button>
         </form>
         <form method="post" action="/filter">
