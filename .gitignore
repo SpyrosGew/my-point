@@ -1,2 +1,28 @@
 yolov8n-seg.pt
 yolov8x-seg.pt
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local model weights and downloaded model caches
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
+*.bin
+*.gguf
+*.ckpt
+*.tflite
+*.weights
+# Generated inference/debug outputs
+outputs/
+*.jpg
+*.jpeg
+*.png
+# Local Hugging Face / runtime caches
+.cache/
+models/huggingface/
+models/rtmlib/
